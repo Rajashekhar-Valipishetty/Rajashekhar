@@ -21,7 +21,11 @@ import logging
 import hmac
 import hashlib
 import json
+import threading
 from typing import Dict, Any, List, Optional
+import ccxt
+import pandas as pd
+import pandas_ta as ta
 
 import requests
 from dotenv import load_dotenv
@@ -89,6 +93,25 @@ class DeltaGridBot:
         self.processed_fill_ids = set()
         self.active_grid_orders = {} # To track our placed orders {order_id: order_info}
 
+        # --- Adaptive Strategy Parameters ---
+        self.strategy_config = {
+            'LOW': {'spacing': 0.3, 'grids': 20},   # Tighter grid in low volatility
+            'MEDIUM': {'spacing': 0.8, 'grids': 10}, # Default balanced grid
+            'HIGH': {'spacing': 1.5, 'grids': 6}    # Wider grid in high volatility
+        }
+        self.current_volatility_regime = 'MEDIUM' # Start with a neutral assumption
+        # Set initial grid params from the default medium strategy
+        self.grid_spacing = self.strategy_config[self.current_volatility_regime]['spacing'] / 100.0
+        self.number_of_grids = self.strategy_config[self.current_volatility_regime]['grids']
+
+        # --- Threading Control ---
+        self.stop_event = threading.Event()
+
+    def stop(self):
+        """Signals the bot to stop its execution loop."""
+        logger.info("Stop signal received. The bot will exit after the current loop.")
+        self.stop_event.set()
+
     def _api_request(self, method: str, endpoint: str, data: Optional[Dict] = None) -> Dict[str, Any]:
         """
         A helper method to handle all authenticated API requests.
@@ -153,6 +176,96 @@ class DeltaGridBot:
         mark_price = float(product_details['result']['mark_price'])
         logger.debug(f"Current mark price for {self.symbol}: {mark_price}")
         return mark_price
+
+    def _fetch_recent_candles(self, timeframe: str = '1h', limit: int = 100) -> Optional[pd.DataFrame]:
+        """
+        Fetches the most recent N candles using ccxt to be used in TA calculations.
+        """
+        logger.info(f"Attempting to fetch last {limit} candles for {self.symbol} using ccxt.")
+        try:
+            exchange = ccxt.delta({'options': {'adjustForTimeDifference': True}})
+            exchange.set_sandbox_mode(True)
+            exchange.load_markets()
+
+            if self.symbol == 'BTCUSDT':
+                ccxt_symbol = 'BTC/USDT:USDT'
+            elif self.symbol == 'ETHUSDT':
+                ccxt_symbol = 'ETH/USDT:USDT'
+            else:
+                ccxt_symbol = self.symbol.replace('USDT', '/USDT:USDT')
+
+            if not exchange.has['fetchOHLCV']:
+                logger.warning("CCXT reports that Delta exchange does not support fetchOHLCV.")
+                return None
+
+            ohlcv = exchange.fetch_ohlcv(ccxt_symbol, timeframe, limit=limit)
+
+            if not ohlcv:
+                logger.warning("No candle data returned from ccxt for Delta testnet.")
+                return None
+
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['time'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+            df.set_index('time', inplace=True)
+            df.drop('timestamp', axis=1, inplace=True)
+
+            logger.info(f"Successfully fetched {len(df)} recent candles via ccxt.")
+            return df
+
+        except Exception as e:
+            logger.error(f"Could not fetch recent candles via ccxt due to an error: {e}")
+            return None
+
+    def update_grid_parameters(self) -> bool:
+        """
+        Analyzes market volatility using Bollinger Bands and updates grid
+        parameters if the regime changes.
+
+        Returns:
+            bool: True if the grid parameters were changed, False otherwise.
+        """
+        logger.info("Analyzing market volatility to adapt grid strategy...")
+        candles_df = self._fetch_recent_candles(limit=100)
+
+        if candles_df is None or candles_df.empty:
+            logger.warning("Could not fetch candle data for analysis. Sticking to current parameters.")
+            return False
+
+        # Calculate Bollinger Bands
+        # Using standard parameters (20-period, 2 standard deviations)
+        candles_df.ta.bbands(length=20, append=True)
+
+        # Calculate Bollinger Band Width Percentage
+        candles_df['bb_width_p'] = (candles_df['BBU_20_2.0'] - candles_df['BBL_20_2.0']) / candles_df['BBM_20_2.0']
+
+        # Get the latest band width value
+        latest_bbwp = candles_df['bb_width_p'].iloc[-1]
+
+        new_regime = None
+        # Define thresholds for volatility regimes (these are examples and can be tuned)
+        if latest_bbwp < 0.03: # Example: 3% width = low volatility
+            new_regime = 'LOW'
+        elif latest_bbwp > 0.08: # Example: 8% width = high volatility
+            new_regime = 'HIGH'
+        else:
+            new_regime = 'MEDIUM'
+
+        logger.info(f"Latest BBW%: {latest_bbwp:.4f}. Detected regime: {new_regime}")
+
+        if new_regime != self.current_volatility_regime:
+            logger.warning(f"Volatility regime change detected! From {self.current_volatility_regime} to {new_regime}.")
+            self.current_volatility_regime = new_regime
+
+            # Update parameters from the strategy config
+            new_params = self.strategy_config[new_regime]
+            self.grid_spacing = new_params['spacing'] / 100.0
+            self.number_of_grids = new_params['grids']
+
+            logger.warning(f"New grid parameters: Spacing={new_params['spacing']}%, Grids={new_params['grids']}")
+            return True # Signal that parameters have changed
+
+        logger.info(f"Volatility regime stable at {self.current_volatility_regime}. No changes to grid.")
+        return False
 
     def cancel_all_orders(self) -> None:
         """Cancels all existing open orders for the product."""
@@ -283,7 +396,18 @@ class DeltaGridBot:
 
             # --- Main Event Loop ---
             logger.info("\n--- Entering main event loop ---\n")
-            while True:
+            loop_counter = 0
+            while not self.stop_event.is_set():
+                # --- Adaptive Strategy Check (every 15 loops) ---
+                if loop_counter % 15 == 0:
+                    if self.update_grid_parameters():
+                        logger.info("Regime change detected, resetting grid.")
+                        self.cancel_all_orders()
+                        time.sleep(2) # Pause for safety
+                        current_price = self.get_mark_price()
+                        self.place_initial_grid(current_price)
+                        logger.info("Grid has been reset with new parameters.")
+
                 current_price = self.get_mark_price()
 
                 # 1. Global Stop-Loss Check
@@ -298,6 +422,7 @@ class DeltaGridBot:
                 self.check_fills_and_rebalance()
 
                 logger.debug(f"Loop finished. Waiting for {loop_interval_sec} seconds...")
+                loop_counter += 1
                 time.sleep(loop_interval_sec)
 
         except (ValueError, requests.exceptions.RequestException) as e:
@@ -325,23 +450,18 @@ if __name__ == '__main__':
     # If a buy order at $60,000 is placed, the size will be 100/60000 contracts.
     INVESTMENT_PER_GRID_LINE = 100.0  # in USDT
 
-    # Total number of buy and sell orders to maintain.
-    # 10 means 5 buy orders and 5 sell orders.
-    NUMBER_OF_GRIDS = 10
-
-    # The distance between grid lines as a percentage of the price.
-    # 0.5 means orders will be placed 0.5% apart.
-    GRID_SPACING_PERCENT = 0.5 # 0.5%
+    # Total number of buy and sell orders to maintain. This is now controlled by the adaptive strategy.
+    # The distance between grid lines as a percentage of the price. This is now controlled by the adaptive strategy.
 
     # If the price drops by this percentage from the start, cancel all orders and stop.
     GLOBAL_STOP_LOSS_PERCENT = 5.0 # 5%
 
     try:
+        # This part will only run if a .env file with API keys is present.
+        # number_of_grids and grid_spacing_percent are now managed internally by the bot.
         bot = DeltaGridBot(
             symbol=SYMBOL,
             investment_per_grid=INVESTMENT_PER_GRID_LINE,
-            number_of_grids=NUMBER_OF_GRIDS,
-            grid_spacing_percent=GRID_SPACING_PERCENT,
             global_stop_loss_percent=GLOBAL_STOP_LOSS_PERCENT
         )
         bot.run()

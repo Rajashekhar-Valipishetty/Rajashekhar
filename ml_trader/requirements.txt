@@ -1,0 +1,14 @@
+# Core bot dependencies
+requests
+python-dotenv
+
+# ML and Data Analysis
+scikit-learn
+pandas
+pandas-ta
+
+# Frontend API
+Flask
+
+# CCXT Library for reliable exchange interaction
+ccxt
