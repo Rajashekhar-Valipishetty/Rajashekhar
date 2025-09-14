@@ -141,7 +141,7 @@ def status():
         return jsonify({
             "status": "Running",
             "symbol": bot_instance.symbol,
-            "regime": bot_instance.current_volatility_regime,
+            "regime": bot_instance.current_regime_name,
             "grid_spacing": f"{bot_instance.grid_spacing * 100:.2f}%",
             "grid_count": bot_instance.number_of_grids
         })

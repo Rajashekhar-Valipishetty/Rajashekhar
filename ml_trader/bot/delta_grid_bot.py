@@ -26,6 +26,7 @@ from typing import Dict, Any, List, Optional
 import ccxt
 import pandas as pd
 import pandas_ta as ta
+import joblib
 
 import requests
 from dotenv import load_dotenv
@@ -93,19 +94,46 @@ class DeltaGridBot:
         self.processed_fill_ids = set()
         self.active_grid_orders = {} # To track our placed orders {order_id: order_info}
 
-        # --- Adaptive Strategy Parameters ---
+        # --- AI Model and Strategy Parameters ---
+        self.model = None
+        self.scaler = None
+        self._load_model_and_scaler()
+
+        # The strategy config now maps cluster numbers (0, 1, 2, 3) to grid params.
+        # The user will need to analyze their trained model to label these clusters
+        # and configure this map appropriately. I will use placeholder labels.
         self.strategy_config = {
-            'LOW': {'spacing': 0.3, 'grids': 20},   # Tighter grid in low volatility
-            'MEDIUM': {'spacing': 0.8, 'grids': 10}, # Default balanced grid
-            'HIGH': {'spacing': 1.5, 'grids': 6}    # Wider grid in high volatility
+            0: {'name': 'Low Volatility', 'spacing': 0.3, 'grids': 20},
+            1: {'name': 'Medium Volatility', 'spacing': 0.8, 'grids': 10},
+            2: {'name': 'High Volatility', 'spacing': 1.5, 'grids': 6},
+            3: {'name': 'High Volatility Trend', 'spacing': 2.0, 'grids': 4}
         }
-        self.current_volatility_regime = 'MEDIUM' # Start with a neutral assumption
-        # Set initial grid params from the default medium strategy
-        self.grid_spacing = self.strategy_config[self.current_volatility_regime]['spacing'] / 100.0
-        self.number_of_grids = self.strategy_config[self.current_volatility_regime]['grids']
+        self.current_regime_name = 'N/A'
+        self.current_regime_label = -1 # Start with an invalid label
 
         # --- Threading Control ---
         self.stop_event = threading.Event()
+
+    def _load_model_and_scaler(self):
+        """Loads the trained KMeans model and scaler from disk."""
+        try:
+            # Construct paths relative to this file's location
+            bot_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(bot_dir)
+            model_path = os.path.join(project_root, 'kmeans_model.pkl')
+            scaler_path = os.path.join(project_root, 'scaler.pkl')
+
+            self.model = joblib.load(model_path)
+            self.scaler = joblib.load(scaler_path)
+            logger.info(f"Successfully loaded AI model from {model_path} and scaler from {scaler_path}.")
+        except FileNotFoundError:
+            logger.warning("AI model or scaler file not found. The bot will not use the AI strategy.")
+            self.model = None
+            self.scaler = None
+        except Exception as e:
+            logger.error(f"Error loading model/scaler: {e}")
+            self.model = None
+            self.scaler = None
 
     def stop(self):
         """Signals the bot to stop its execution loop."""
@@ -216,55 +244,81 @@ class DeltaGridBot:
             logger.error(f"Could not fetch recent candles via ccxt due to an error: {e}")
             return None
 
+    def _engineer_features_for_prediction(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculates the same features used in training for a given DataFrame."""
+        if df.empty:
+            return pd.DataFrame()
+
+        df.ta.atr(length=14, append=True)
+        if 'ATR_14' in df.columns:
+            df['atr_p'] = df['ATR_14'] / df['close'] * 100
+
+        bbands = df.ta.bbands(length=20)
+        if bbands is not None and all(col in bbands.columns for col in ['BBU_20_2.0', 'BBL_20_2.0', 'BBM_20_2.0']):
+            df['bb_width_p'] = (bbands['BBU_20_2.0'] - bbands['BBL_20_2.0']) / bbands['BBM_20_2.0'] * 100
+
+        df.ta.rsi(length=14, append=True)
+
+        macd = df.ta.macd(fast=12, slow=26)
+        if macd is not None and 'MACDh_12_26_9' in macd.columns:
+            df['macd_hist'] = macd['MACDh_12_26_9']
+
+        if len(df) > 5:
+            df['ema_5_slope'] = df.ta.ema(length=5).diff()
+
+        return df
+
     def update_grid_parameters(self) -> bool:
         """
-        Analyzes market volatility using Bollinger Bands and updates grid
+        Predicts market regime using the loaded AI model and updates grid
         parameters if the regime changes.
 
         Returns:
             bool: True if the grid parameters were changed, False otherwise.
         """
-        logger.info("Analyzing market volatility to adapt grid strategy...")
-        candles_df = self._fetch_recent_candles(limit=100)
-
-        if candles_df is None or candles_df.empty:
-            logger.warning("Could not fetch candle data for analysis. Sticking to current parameters.")
+        if not self.model or not self.scaler:
+            logger.debug("AI model not loaded. Skipping adaptive strategy.")
             return False
 
-        # Calculate Bollinger Bands
-        # Using standard parameters (20-period, 2 standard deviations)
-        candles_df.ta.bbands(length=20, append=True)
+        logger.info("Predicting market regime with AI model...")
+        candles_df = self._fetch_recent_candles(limit=100)
 
-        # Calculate Bollinger Band Width Percentage
-        candles_df['bb_width_p'] = (candles_df['BBU_20_2.0'] - candles_df['BBL_20_2.0']) / candles_df['BBM_20_2.0']
+        if candles_df is None or len(candles_df) < 30: # Need enough data for indicators
+            logger.warning("Could not fetch sufficient candle data for prediction.")
+            return False
 
-        # Get the latest band width value
-        latest_bbwp = candles_df['bb_width_p'].iloc[-1]
+        # Engineer features for the new data
+        features_df = self._engineer_features_for_prediction(candles_df)
 
-        new_regime = None
-        # Define thresholds for volatility regimes (these are examples and can be tuned)
-        if latest_bbwp < 0.03: # Example: 3% width = low volatility
-            new_regime = 'LOW'
-        elif latest_bbwp > 0.08: # Example: 8% width = high volatility
-            new_regime = 'HIGH'
-        else:
-            new_regime = 'MEDIUM'
+        feature_columns = ['atr_p', 'bb_width_p', 'RSI_14', 'macd_hist', 'ema_5_slope']
+        existing_features = [col for col in feature_columns if col in features_df.columns]
 
-        logger.info(f"Latest BBW%: {latest_bbwp:.4f}. Detected regime: {new_regime}")
+        if not existing_features or features_df[existing_features].iloc[-1].isnull().any():
+            logger.warning("Could not generate all necessary features for the latest data point.")
+            return False
 
-        if new_regime != self.current_volatility_regime:
-            logger.warning(f"Volatility regime change detected! From {self.current_volatility_regime} to {new_regime}.")
-            self.current_volatility_regime = new_regime
+        # Get the latest features and scale them
+        latest_features = features_df[existing_features].iloc[-1:].values
+        scaled_features = self.scaler.transform(latest_features)
 
-            # Update parameters from the strategy config
-            new_params = self.strategy_config[new_regime]
+        # Predict the regime
+        predicted_regime_label = self.model.predict(scaled_features)[0]
+
+        if predicted_regime_label != self.current_regime_label:
+            regime_info = self.strategy_config.get(predicted_regime_label, {'name': 'Unknown'})
+            self.current_regime_name = regime_info['name']
+
+            logger.warning(f"AI Detected Regime Change! New Regime: {predicted_regime_label} ({self.current_regime_name})")
+            self.current_regime_label = predicted_regime_label
+
+            new_params = self.strategy_config[predicted_regime_label]
             self.grid_spacing = new_params['spacing'] / 100.0
             self.number_of_grids = new_params['grids']
 
             logger.warning(f"New grid parameters: Spacing={new_params['spacing']}%, Grids={new_params['grids']}")
-            return True # Signal that parameters have changed
+            return True
 
-        logger.info(f"Volatility regime stable at {self.current_volatility_regime}. No changes to grid.")
+        logger.info(f"Market regime stable at {self.current_regime_label} ({self.current_regime_name}).")
         return False
 
     def cancel_all_orders(self) -> None:
@@ -458,7 +512,7 @@ if __name__ == '__main__':
 
     try:
         # This part will only run if a .env file with API keys is present.
-        # number_of_grids and grid_spacing_percent are now managed internally by the bot.
+        # The bot now manages its own grid parameters internally based on the AI model.
         bot = DeltaGridBot(
             symbol=SYMBOL,
             investment_per_grid=INVESTMENT_PER_GRID_LINE,
