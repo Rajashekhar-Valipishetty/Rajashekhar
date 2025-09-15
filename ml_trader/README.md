@@ -54,14 +54,31 @@ Follow these steps carefully to get the bot running on your local machine.
 
 ### Step 3: Process Your Tick Data
 
-This step converts your raw CSV trade data into a format the AI can learn from.
+This step converts your raw CSV trade data into a format the AI can learn from. You have two options.
 
-1.  Place your tick data CSV file(s) somewhere on your computer. Make sure they have the format: `product_symbol,price,size,timestamp,buyer_role`.
+**Option A: The Easy Way (Recommended)**
+
+I have created a special script to process all your files at once.
+
+1.  Open the `batch_process.py` file in a text editor.
+2.  **Very Important:** Verify that the list of file paths at the top of the file exactly matches the locations of the files on your computer. Make any necessary corrections.
+3.  In your terminal, from the main `ml_trader` directory, run this single command:
+    ```bash
+    python batch_process.py
+    ```
+    This script will then go through each file one by one and process it into the database.
+
+**Option B: The Manual Way**
+
+If you prefer to process files one at a time, you can do so with the following command.
+
+1.  Make sure your CSV files have the format: `product_symbol,price,size,timestamp,buyer_role`.
 2.  In your terminal, from the main `ml_trader` directory, run the following command for **each** CSV file you want to process. Replace `/path/to/your/file.csv` with the actual path to your file.
     ```bash
     python process_ticks.py /path/to/your/file.csv
     ```
-    This will create and populate a `market_data.db` file in your project folder.
+
+Either method will create and populate a `market_data.db` file in your project folder, which is needed for the next step.
 
 ### Step 4: Train the AI Model
 
